@@ -57,9 +57,20 @@ def get_aws_region(region_name):
 
 def get_ec2_instances(session, region, name_filter):
     ec2_client = session.client('ec2', region_name=region)
-    response = ec2_client.describe_instances(Filters=[{'Name': 'tag:Name', 'Values': [f"*{name_filter}*"]}])
-    instances = [instance['InstanceId'] for reservation in response['Reservations'] for instance in reservation['Instances']]
+    response = ec2_client.describe_instances(
+        Filters=[{'Name': 'tag:Name', 'Values': [f"*{name_filter}*"]}]
+    )
+    instances = {}
+    for reservation in response['Reservations']:
+        for instance in reservation['Instances']:
+            instance_id = instance['InstanceId']
+            name_tag = next(
+                (tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), None
+            )
+            if name_tag:
+                instances[instance_id] = name_tag
     return instances
+
 
 def get_target_groups(session, region):
     elbv2_client = session.client('elbv2', region_name=region)
@@ -326,6 +337,8 @@ def check_health_before_deregistering(session, instance_id, service, target_grou
     else:
         print(f"❌ Instance {instance_id} failed health check before deregistering. Skipping further actions.")
         return False
+    
+    
 
 def scale_instances_if_needed(session, target_group_arns, region):
     """Ensure at least 2 instances in the target group for high availability using Auto Scaling."""
@@ -405,58 +418,79 @@ def revert_asg_capacity(session, asg_name, region, original_desired_capacity):
     )
     print(f"✅ Reverted the desired capacity of ASG {asg_name} back to {original_desired_capacity}.")
 
-def process_instances(session, target_group_arns, target_group_key, region):
-    # First, ensure at least 2 instances are available for high availability
-    new_instance_id = scale_instances_if_needed(session, target_group_arns, region)
-
-    # Proceed with your original instance processing
-    instances = get_target_group_instances(session, target_group_arns, region)
-    if not instances:
-        print(f"❌ No instances found in target group {target_group_key}.")
-        return
-
-    num_instances = (len(instances) + 1) // 2
-    instances_to_process = instances[:num_instances]
-
-    processed_instances = set()  # Track processed instances
+def process_instances(session, instance_target_group_map, service_name, region):
+    processed_instances = set()
+    new_instance_id = None
     original_asg_name = None
     original_desired_capacity = None
 
+    # Flatten all target groups used, to check HA status globally
+    all_target_group_arns = set()
+    for tg_list in instance_target_group_map.values():
+        all_target_group_arns.update(tg_list)
+    all_target_group_arns = list(all_target_group_arns)
+
+    # Step 1: High availability check — scale up if only one instance is active
+    new_instance_id = scale_instances_if_needed(session, all_target_group_arns, region)
+
+    # Step 2: Process instances (custom logic based on how many instances exist)
+    all_instances = list(instance_target_group_map.keys())
+
+    # ✅ FIXED LOGIC: process all if 2 or fewer, else half+1
+    if len(all_instances) <= 2:
+        instances_to_process = all_instances
+    else:
+        num_instances = (len(all_instances) + 1) // 2
+        instances_to_process = all_instances[:num_instances]
+
     for instance_id in instances_to_process:
-        # Skip if already processed
         if instance_id in processed_instances:
             continue
 
-        # First, perform the health check before deregistering
-        if not check_health_before_deregistering(session, instance_id, target_group_key, target_group_arns, region):
-            continue  # Skip if health check before deregistration fails
-
-        # Drain the instance from the target group and ensure it's fully drained
-        if not drain_instance(session, instance_id, target_group_arns, region):
-            print(f"❌ Failed to drain instance {instance_id}. Skipping further actions.")
+        target_group_arns = instance_target_group_map.get(instance_id, [])
+        if not target_group_arns:
+            print(f"⚠️ No target groups associated with instance {instance_id}. Skipping.")
             continue
 
-        print(f"⚙️ Executing chef-client on {instance_id}...")  # Execute chef-client only after health check passes
-        execute_ssm_command(session, instance_id, "sudo chef-client", region)
+        # Health check before deregistration
+        if not check_health_before_deregistering(session, instance_id, service_name, target_group_arns, region):
+            continue
 
-        print(f"🔄 Running health check for instance {instance_id} after chef-client...")  # No health check before re-registration
-        print(f"🔄 Re-registering instance {instance_id}...")
+        # Drain instance
+        if not drain_instance(session, instance_id, target_group_arns, region):
+            print(f"❌ Failed to drain instance {instance_id}. Skipping.")
+            continue
+
+        # Chef-client execution
+        print(f"⚙️ Running chef-client on {instance_id}...")
+        chef_output = execute_ssm_command(session, instance_id, "sudo chef-client", region)
+        print(f"📄 Chef-client output:\n{chef_output[0]}")
+
+        # Post-chef-client health check (informational only)
+        print(f"🔍 Performing post-chef-client health check on {instance_id}...")
+        post_chef_health = check_health_before_deregistering(session, instance_id, service_name, target_group_arns, region)
+        status_msg = "✅ Passed" if post_chef_health else "❌ Failed"
+        print(f"📊 Post-chef-client health check result: {status_msg}")
+
+        # Re-register to target groups
+        print(f"🔄 Re-registering instance {instance_id} to its original target group(s)...")
         register_instance(session, instance_id, target_group_arns, region)
 
-        # Mark the instance as processed
+
         processed_instances.add(instance_id)
 
-        # Store the ASG info for later reversion
+        # Store ASG capacity for revert
         if not original_asg_name:
             original_asg_name = get_auto_scaling_group(session, region, instance_id)
-            # Get current desired capacity to revert later
-            asg_client = session.client('autoscaling', region_name=region)
-            response = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[original_asg_name])
-            original_desired_capacity = response['AutoScalingGroups'][0]['DesiredCapacity']
+            if original_asg_name:
+                asg_client = session.client('autoscaling', region_name=region)
+                response = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[original_asg_name])
+                if response['AutoScalingGroups']:
+                    original_desired_capacity = response['AutoScalingGroups'][0]['DesiredCapacity']
 
-    print("✅ All instances processed successfully.")
+    print("✅ All selected instances processed successfully.")
 
-    # After everything is done, terminate the newly launched instance and revert the ASG desired capacity
+    # Step 3: Cleanup — terminate temp instance if created and revert ASG scaling
     if new_instance_id:
         terminate_new_instance(session, new_instance_id, region)
 
@@ -465,41 +499,64 @@ def process_instances(session, target_group_arns, target_group_key, region):
 
 
 
+
 def main():
     session = ensure_aws_session()
     region = input("Enter AWS region (e.g., us-west-2, us-east-1): ")
     print(f"✅ Using AWS region: {region}")
 
-    service_name = input("Enter the service name (e.g., kpns, workspace, etc.): ")
-    target_group_arn = get_target_group_for_service(service_name, session, region)
+    service_input = input("Enter the service name(s), comma-separated (e.g., kpns, workspace, auth0, auth1): ")
+    service_names = [s.strip() for s in service_input.split(",") if s.strip()]
 
-    if not target_group_arn:
-        print(f"❌ No Target Group found for service {service_name}. Exiting.")
+    if not service_names:
+        print("❌ No valid service names provided. Exiting.")
         return
 
-    instances = get_ec2_instances(session, region, service_name)
-    if not instances:
-        print("❌ No EC2 instances found for the given service name.")
-        return
-    print(f"✅ Found EC2 instances: {instances}")
+    for service_name in service_names:
+        print(f"\n🚀 Processing service: {service_name}")
 
-    target_group_arns = []
-    for instance_id in instances:
-        asg_name = get_auto_scaling_group(session, region, instance_id)
-        if asg_name:
-            asg_target_groups = get_asg_target_groups(session, region, asg_name)
-            target_group_arns.extend(asg_target_groups)
+        # Optional: still get a matching TG by service name
+        target_group_arn = get_target_group_for_service(service_name, session, region)
 
-    if not target_group_arns:
-        print("❌ No target groups found for instances.")
-        return
+        if not target_group_arn:
+            print(f"❌ No Target Group found for service {service_name}. Skipping.")
+            continue
 
-    # Log to verify if the process is being triggered multiple times
-    print(f"🔄 Starting instance processing for target group ARN(s): {target_group_arns}")
-    process_instances(session, target_group_arns, service_name, region)
+        # Step 1: Get instances matching service name (instance_id → Name tag)
+        instance_name_map = get_ec2_instances(session, region, service_name)
+        if not instance_name_map:
+            print(f"❌ No EC2 instances found for service {service_name}. Skipping.")
+            continue
 
-    # Add an exit condition to ensure the script stops here
-    print("✅ All instances processed successfully. Exiting script.")
+        print(f"✅ Found EC2 instances: {list(instance_name_map.keys())}")
+
+        # Step 2: Map each instance to its own target groups
+        instance_target_group_map = {}
+        for instance_id, name_tag in instance_name_map.items():
+            asg_name = get_auto_scaling_group(session, region, instance_id)
+            if asg_name:
+                asg_target_groups = get_asg_target_groups(session, region, asg_name)
+                if asg_target_groups:
+                    instance_target_group_map[instance_id] = asg_target_groups
+                else:
+                    print(f"⚠️ No target groups found for ASG {asg_name} (instance {instance_id})")
+            else:
+                print(f"⚠️ No ASG found for instance {instance_id}")
+
+        if not instance_target_group_map:
+            print(f"❌ No target group mappings found for any instances of {service_name}. Skipping.")
+            continue
+
+        # Step 3: Process each instance with its mapped target groups
+        print(f"🔄 Starting instance processing for service '{service_name}'")
+        process_instances(session, instance_target_group_map, service_name, region)
+
+        print(f"✅ Finished processing service: {service_name}")
+
+    print("\n✅ All provided services have been processed. Exiting script.")
+
+
 
 if __name__ == "__main__":
     main()
+
