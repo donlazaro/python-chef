@@ -30,6 +30,18 @@ def aws_sso_login():
     print("❌ All AWS SSO login attempts failed. Please log in manually using 'aws sso login'.")
     exit(1)
 
+def aws_sso_login_for_profile(profile_name):
+    """Ensure AWS SSO session is active for the selected profile."""
+    print(f"🔐 Logging in with AWS SSO for profile: {profile_name}")
+    try:
+        subprocess.run(["aws", "sso", "login", "--profile", profile_name], check=True)
+        print(f"✅ AWS SSO login successful for profile: {profile_name}")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ AWS SSO login failed for profile: {profile_name}")
+        print(e)
+        exit(1)
+
+
 def choose_aws_profile():
     """Prompt the user to select an AWS profile from the ~/.aws/config."""
     # Load profiles from ~/.aws/config
@@ -541,7 +553,6 @@ def process_instances(session, instance_target_group_map, service_name, region):
 
 
 
-
 def main():
     # Ask for the AWS profile to use (dev, qa, stg) or let the user choose from config
     profile_name = choose_aws_profile()
@@ -551,6 +562,9 @@ def main():
         print(f"Using default AWS profile: {profile_name}")
 
     # Create an AWS session using the selected or default profile
+    session = ensure_aws_session(profile_name)
+
+      # Create an AWS session using the selected or default profile
     session = ensure_aws_session(profile_name)
 
     # Request the AWS region
